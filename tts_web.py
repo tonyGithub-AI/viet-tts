@@ -207,8 +207,6 @@ with gr.Blocks(title="VietTTS Reader") as demo:
                     gr.Markdown("*Audio will appear here chunk-by-chunk...*")
                 for i, p in enumerate(paths):
                     gr.Audio(value=p, label=f"▶️ Part {i+1}", interactive=False, autoplay=(i == 0))
-            
-            status = gr.Textbox(label="📊 Status", interactive=False)
 
     with gr.Accordion("🛠️ Technical Details / Full Error Report", open=False):
         technical_log = gr.Code(label="Traceback Log", language="python", interactive=False)
@@ -216,7 +214,7 @@ with gr.Blocks(title="VietTTS Reader") as demo:
     gr.Markdown("*Optimal: 0.8-1.2x for audiobooks. ~5-10min synth for 20K chars.*")
 
     # Bindings
-    btn.click(read_aloud, inputs=[textbox, speed_slider], outputs=[audio_state, status, technical_log])
+    btn.click(read_aloud, inputs=[textbox, speed_slider], outputs=[audio_state, server_status, technical_log])
     server_btn.click(ui_restart, outputs=[server_status])
     
     # On Load check
