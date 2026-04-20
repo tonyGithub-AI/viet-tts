@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+.venv/
+venv/
+ENV/
+
+# Large models and data
+pretrained-models/
+samples/
+Viet-TTS.zip
+
+# Logs and temp
+*.log
+temp_check.txt
+test_write.txt
+
+# OS
+.DS_Store
