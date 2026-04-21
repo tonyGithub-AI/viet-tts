@@ -58,33 +58,49 @@ def restart_server():
 client = OpenAI(base_url=VIET_TTS_URL, api_key="viet-tts")
 
 def smart_split(text, max_chars=2000):
-    """Split into natural sentence chunks (~2K chars for FAST response)."""
+    """Split into natural sentence chunks, keeping First chunk extremely small for instant playback."""
     sentences = re.split(r'(?<=[\.!\?])\s+', text)
     chunks, current = [], ""
+    
+    is_first_chunk = True
+    
     for sent in sentences:
-        if len(sent) > max_chars:
+        target_limit = 250 if is_first_chunk else max_chars
+        
+        if len(sent) > target_limit:
             if current.strip():
                 chunks.append(current.strip())
+                is_first_chunk = False
                 current = ""
+                # Re-evaluate target_limit since we committed a chunk
+                target_limit = 250 if is_first_chunk else max_chars
+                
             words = sent.split()
             temp_chunk = ""
             for word in words:
-                if len(word) > max_chars:
+                if len(word) > target_limit:
                     if temp_chunk.strip():
                         chunks.append(temp_chunk.strip())
+                        is_first_chunk = False
+                        target_limit = 250 if is_first_chunk else max_chars
                         temp_chunk = ""
-                    for i in range(0, len(word), max_chars):
-                        chunks.append(word[i:i+max_chars])
-                elif len(temp_chunk + word) < max_chars:
+                    for i in range(0, len(word), target_limit):
+                        chunks.append(word[i:i+target_limit])
+                        is_first_chunk = False
+                        target_limit = 250 if is_first_chunk else max_chars
+                elif len(temp_chunk + word) < target_limit:
                     temp_chunk += word + " "
                 else:
                     chunks.append(temp_chunk.strip())
+                    is_first_chunk = False
+                    target_limit = 250 if is_first_chunk else max_chars
                     temp_chunk = word + " "
             current = temp_chunk
-        elif len((current + sent).strip()) < max_chars:
+        elif len((current + sent).strip()) < target_limit:
             current += sent + " "
         else:
             chunks.append(current.strip())
+            is_first_chunk = False
             current = sent + " "
     
     if current.strip():
@@ -134,11 +150,22 @@ def read_aloud(text, speed, progress=gr.Progress(track_tqdm=True)):
     audio_paths = [None] * n_chunks
     
     # FAST approach: Generate first chunk immediately
-    progress(0, desc=f"FAST START: Chunk 1/{n_chunks}")
-    first_wav = synth_chunk(0, chunks[0], speed)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as fast_executor:
+        first_future = fast_executor.submit(synth_chunk, 0, chunks[0], speed)
+        seconds_waited = 0
+        while not first_future.done():
+            time.sleep(0.5)
+            seconds_waited += 0.5
+            # loop progress bar from 0.0 to 1.0 continuously
+            progress((seconds_waited % 5.0) / 5.0, desc=f"FAST START: Chunk 1/{n_chunks} ({seconds_waited:.1f}s)")
+            yield [p for p in audio_paths if p], f"⏳ Synthesizing Chunk 1/{n_chunks}... ({seconds_waited:.1f}s)", ""
+            
+        first_wav = first_future.result()
+
     if first_wav:
         audio_paths[0] = first_wav
         tmp_files.append(first_wav)
+        progress(1.0/n_chunks, desc=f"Chunk 1 ready!")
         yield [p for p in audio_paths if p], f"⚡ Chunk 1 ready! Starting playback while processing others...", ""
     
     if n_chunks == 1:
@@ -207,6 +234,8 @@ with gr.Blocks(title="VietTTS Reader") as demo:
                     gr.Markdown("*Audio will appear here chunk-by-chunk...*")
                 for i, p in enumerate(paths):
                     gr.Audio(value=p, label=f"▶️ Part {i+1}", interactive=False, autoplay=(i == 0))
+            
+            status = gr.Textbox(label="📊 Progress Info", interactive=False)
 
     with gr.Accordion("🛠️ Technical Details / Full Error Report", open=False):
         technical_log = gr.Code(label="Traceback Log", language="python", interactive=False)
@@ -214,7 +243,7 @@ with gr.Blocks(title="VietTTS Reader") as demo:
     gr.Markdown("*Optimal: 0.8-1.2x for audiobooks. ~5-10min synth for 20K chars.*")
 
     # Bindings
-    btn.click(read_aloud, inputs=[textbox, speed_slider], outputs=[audio_state, server_status, technical_log])
+    btn.click(read_aloud, inputs=[textbox, speed_slider], outputs=[audio_state, status, technical_log])
     server_btn.click(ui_restart, outputs=[server_status])
     
     # On Load check
