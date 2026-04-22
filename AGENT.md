@@ -5,8 +5,9 @@ This document outlines the rules and best practices for the AI Agent (Antigravit
 ## Core Rules
 
 1.  **Synchronization Rule**:
-    - Every code change must be accompanied by corresponding updates to the PRD (`TTS_PRD.md`) and the relevant test files.
+    - Every code change (including those made manually by the user or dynamically by the agent) _must_ be accompanied by corresponding updates to the PRD (`TTS_PRD.md`) and the relevant test files if it is not already documented.
     - Conversely, any update to the PRD or tests must be reflected in the code implementation.
+    - **Explicit PRD Update Rule:** If any code changes are introduced that are not already in the PRD, you MUST update the PRD accordingly.
     - This ensures that the documentation, tests, and code remain in sync at all times.
 
 2.  **Regression Testing Rule**:

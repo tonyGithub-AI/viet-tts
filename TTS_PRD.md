@@ -20,7 +20,7 @@
 **Success Criteria**:
 
 - 20K VN chars → Sequential results → First part ready in <30s → Full background completion.
-- Speed tunable, young female voice perfect.
+- Speed tunable, voice selector properly configured and dynamically sourced.
 - Parallel processing (2 workers) ensures background chunks are ready before current playback ends.
 
 **Deliverables**:
@@ -38,10 +38,11 @@
 
 ```
 🗣️ Vietnamese TTS Book Reader
-[Large Textarea (25 lines): Paste chapter...] [Speed Slider: 0.5-2.0]
+[Large Textarea (25 lines): Paste chapter...]
+[Voice Selection Dropdown] [Speed Slider: 0.5-2.0]
     🎤 Read Aloud (Primary Button)
-    [Gallery/List of Audio Chunks]
-    [Status: Real-time progress]
+    [Gallery/List of Audio Chunks (with individual generation timing)]
+    [Status: Real-time progress + Overall Elapsed Timer]
 ```
 
 2. **Flow**:
@@ -49,7 +50,7 @@
 - Paste → Click → **Smart split** (~2K-4K char chunks).
 - **Sequential Synth**: Synth first chunk and `yield` to UI immediately.
 - **Background Processing**: Continue synthing next chunks while user listens.
-- **Auto-Cleanup**: `atexit` handles removal of all temp WAVs on exit.
+- **Auto-Cleanup & Safe Shutdown**: `atexit` handles removal of all temp WAVs on exit while a robust `SIGINT/SIGTERM` custom signal handler directly kills UI/backend processes, bypassing Uvicorn's graceful exit to rigorously prevent zombie ports (Errno 98: address already in use).
 - Temp WAVs → Individual playback items in gallery.
 
 3. **Limits/Perf**:
@@ -61,7 +62,7 @@
 
 4. **Edge Cases**: Empty = "Enter text!", Errors in status.
 
-5. **Voice**: **nguyen-ngoc-ngan** (young/warm female).
+5. **Voice**: Dynamically bound UI select component fetching available voices on server check from `/v1/voices` (Options include: Nguyễn Ngọc Ngạn, Nữ Nhẹ Nhàng, Quỳnh, and more).
 
 6. **Policy**: **No filtering**—speaks all content (adult OK).
 
@@ -443,6 +444,7 @@ This section codifies the "Premium Soft" design system used for the VietTTS Read
 | :-------------------- | :-------- | :------ | :--------------------------------------------------------- |
 | **🗣️ Title**          | Markdown  | Full    | H1 level, bold emoji branding.                             |
 | **📖 Text Canvas**    | Textbox   | `3`     | `lines=25`, vertical scrolling enabled.                    |
+| **🗣️ Voice Select**   | Select    | `1`     | Populates options asynchronously post-server verification. |
 | **⚡ Speed Slider**   | Slider    | `1`     | Range: `0.5` - `2.0`, Step: `0.1`, Default: `1.0`.         |
 | **🎤 Action Button**  | Button    | `1`     | `variant="primary"`, `size="lg"`, focus color transitions. |
 | **🔄 Restart Server** | Button    | `1`     | Secondary style, triggers backend lifecycle recovery.      |
@@ -453,11 +455,11 @@ This section codifies the "Premium Soft" design system used for the VietTTS Read
 
 ### 4. UX & Motion Design
 
-- **Orchestration**: Synthesis happens in chunks; the UI provides a real-time progress bar (`gr.Progress`) and dedicated **📊 Status** logs with localized descriptions (e.g., "Synth 2/5").
+- **Orchestration**: Synthesis happens in chunks; the UI provides a real-time progress bar (`gr.Progress`), comprehensive elapsed timers reflecting real-time processing duration (`overallTimer`), exact interval polling per chunk element (`chunkTimers`), and localized status descriptions mapped natively onto the front-end layout to give fine-tuned duration visibility.
 - **Error Resilience**:
   - **Pre-flight Check**: Backend connectivity is verified on load and before any synthesis request.
   - **Diagnostic Transparency**: Full technical tracebacks are exposed via the "Technical Details" accordion on failure, enabling user-led troubleshooting.
-  - **Self-Healing**: A dedicated "Restart Backend Server" button cycles the synthesis engine if connection drops. It now implements a **generator-based pattern** providing rich, real-time UI feedback (graceful shutdown status, wait loops for freeing ports, and AI model load progress updates up to ~60s).
+  - **Self-Healing & Port Management**: A dedicated "Restart Backend Server" button cycles the synthesis engine if connection drops, employing a generator-based pattern with rich, real-time UI feedback. To prevent `address already in use` (port 7860/8298) issues, the backend overrides Uvicorn's default graceful shutdown, implementing a custom forceful SIGINT handler. Even during a catastrophic startup (e.g. `OSError`), a hard `try...finally` lock enforces total cleanup before exiting. This ensures all active subprocesses systematically exit under all circumstances.
 - **Stitching Feedback**: Visual "Stitching audio..." indicator to prevent "frozen UI" perception during final normalization.
 - **Zero-State**: Placeholder text `Paste your full Vietnamese chapter here...` provides immediate affordance.
 - **Mobile Optimizations**: Rows collapse to stacks below 640px viewport width automatically via Gradio's responsive engine.

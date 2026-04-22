@@ -177,6 +177,15 @@ audio { width: 100%; height: 36px; outline: none; }
                 <button class="secondary" id="btn-restart" onclick="restartServer()">🔄 Restart</button>
             </div>
             
+            <div class="slider-group" style="margin-bottom: 0.5rem;">
+                <label><span>🗣️ Voice</span></label>
+                <select id="voice-select" style="padding: 0.8rem; background: rgba(15, 23, 42, 0.6); color: var(--text); border: 1px solid var(--border); border-radius: 12px; font-family: inherit; font-size: 0.95rem; outline: none; transition: border-color 0.3s; width: 100%; cursor: pointer;">
+                    <option value="nguyen-ngoc-ngan">Nguyễn Ngọc Ngạn (Male)</option>
+                    <option value="nu-nhe-nhang">Nữ Nhẹ Nhàng (Female)</option>
+                    <option value="quynh">Quỳnh (Female)</option>
+                </select>
+            </div>
+
             <div class="slider-group">
                 <label><span>⚡ Speed</span> <span id="speed-val">1.0x</span></label>
                 <input type="range" id="speed" min="0.5" max="2.0" step="0.1" value="1.0" oninput="document.getElementById('speed-val').textContent = this.value + 'x'">
@@ -203,11 +212,55 @@ let currentChunks = [];
 let audioQueue = [];
 let synthesizedCount = 0;
 let isPlaying = false;
+let chunkTimers = {};
+let overallTimer = null;
+let synthesisStartTime = null;
+
+function updateOverallProgress() {
+    if(!synthesisStartTime) return;
+    const elapsed = Math.floor((Date.now() - synthesisStartTime) / 1000);
+    const m = Math.floor(elapsed / 60);
+    const s = elapsed % 60;
+    const timeStr = m > 0 ? `${m}m ${s}s` : `${s}s`;
+    
+    const progressText = document.getElementById('progress-text');
+    if(progressText) {
+        progressText.innerHTML = `Progress: ${synthesizedCount}/${currentChunks.length} <span style="margin-left:8px; color:var(--primary); font-weight:600">⏱️ Elapsed: ${timeStr}</span>`;
+    }
+}
 
 function logMessage(msg) {
     const logEl = document.getElementById('log');
     logEl.textContent += `[${new Date().toLocaleTimeString()}] ${msg}\n`;
     logEl.scrollTop = logEl.scrollHeight;
+}
+
+let voicesLoaded = false;
+async function loadVoices() {
+    if(voicesLoaded) return;
+    try {
+        const res = await fetch('http://localhost:8298/v1/voices');
+        if (res.ok) {
+            const voices = await res.json();
+            const select = document.getElementById('voice-select');
+            const currentVal = select.value;
+            select.innerHTML = '';
+            voices.forEach(v => {
+                const opt = document.createElement('option');
+                opt.value = v;
+                let label = v;
+                if(v === 'nguyen-ngoc-ngan') label = 'Nguyễn Ngọc Ngạn (Male)';
+                else if(v.includes('nu-nhe-nhang')) label = 'Nữ Nhẹ Nhàng (Female)';
+                else if(v.includes('quynh')) label = 'Quỳnh (Female)';
+                else if(v.includes('speechify_11') || v.includes('speechify_12')) label = v + ' (Female)';
+                else if(v.includes('cdteam') || v.includes('atuan')) label = v + ' (Male)';
+                opt.textContent = label;
+                select.appendChild(opt);
+            });
+            if(voices.includes(currentVal)) select.value = currentVal;
+            voicesLoaded = true;
+        }
+    } catch(e) {}
 }
 
 async function checkStatus() {
@@ -220,6 +273,7 @@ async function checkStatus() {
         if (data.ready) {
             badge.className = 'status-badge online';
             text.textContent = 'Server Online';
+            loadVoices();
             if(!isPlaying && synthesizedCount === (currentChunks.length || 0)) {
                 // Keep enabled if we are idle and server is ready
                 document.getElementById('btn-read').disabled = false;
@@ -307,13 +361,14 @@ function smartSplit(text, maxChars = 2000) {
 }
 
 async function synthChunk(index, text, speed) {
+    const voiceId = document.getElementById('voice-select') ? document.getElementById('voice-select').value : 'nguyen-ngoc-ngan';
     const response = await fetch('http://localhost:8298/v1/audio/speech', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             input: text,
             model: 'tts-1',
-            voice: 'nguyen-ngoc-ngan',
+            voice: voiceId,
             response_format: 'wav',
             speed: parseFloat(speed)
         })
@@ -381,9 +436,15 @@ async function startReading() {
     synthesizedCount = 0;
     isPlaying = false;
     
+    Object.keys(chunkTimers).forEach(k => clearInterval(chunkTimers[k].interval));
+    chunkTimers = {};
+    if(overallTimer) clearInterval(overallTimer);
+    synthesisStartTime = Date.now();
+    updateOverallProgress();
+    overallTimer = setInterval(updateOverallProgress, 1000);
+    
     document.getElementById('progress-container').style.display = 'block';
     document.getElementById('progress-fill').style.width = '0%';
-    document.getElementById('progress-text').textContent = `Progress: 0/${chunks.length}`;
     
     try {
         logMessage("Synthesizing part 1 (FAST START)...");
@@ -402,6 +463,7 @@ async function startReading() {
         }
     } catch(e) {
         logMessage(`Error synthesizing part 1: ${e.message}`);
+        if(chunkTimers[0]) clearInterval(chunkTimers[0].interval);
         document.getElementById(`chunk-status-0`).textContent = '❌ Error';
         btn.innerHTML = `🎤 Read Aloud`;
         btn.disabled = false;
@@ -416,17 +478,40 @@ function createAudioUI(index) {
     div.innerHTML = `
         <div class="chunk-header">
             <span>▶️ Part ${index + 1}</span>
-            <span id="chunk-status-${index}">⏳ Synthing...</span>
+            <span id="chunk-status-${index}">⏳ Synthing... 0s</span>
         </div>
         <audio id="audio-${index}" controls></audio>
     `;
     list.appendChild(div);
+    
+    chunkTimers[index] = {
+        start: Date.now(),
+        interval: setInterval(() => {
+            const el = document.getElementById(`chunk-status-${index}`);
+            if (el && el.textContent.includes('Synthing')) {
+                const elapsed = Math.floor((Date.now() - chunkTimers[index].start) / 1000);
+                const m = Math.floor(elapsed / 60);
+                const s = elapsed % 60;
+                const t = m > 0 ? `${m}m ${s}s` : `${s}s`;
+                el.innerHTML = `⏳ Synthing... <b>${t}</b>`;
+            } else {
+                if(chunkTimers[index]) clearInterval(chunkTimers[index].interval);
+            }
+        }, 1000)
+    };
 }
 
 function handleChunkReady(index, url) {
     const audioEl = document.getElementById(`audio-${index}`);
     audioEl.src = url;
-    document.getElementById(`chunk-status-${index}`).textContent = '✅ Ready';
+    
+    if(chunkTimers[index]) clearInterval(chunkTimers[index].interval);
+    const elapsed = Math.floor((Date.now() - chunkTimers[index].start) / 1000);
+    const m = Math.floor(elapsed / 60);
+    const s = elapsed % 60;
+    const t = m > 0 ? `${m}m ${s}s` : `${s}s`;
+    
+    document.getElementById(`chunk-status-${index}`).innerHTML = `✅ Ready <i>(${t})</i>`;
     
     audioEl.addEventListener('ended', playNextAudio);
     
@@ -435,7 +520,11 @@ function handleChunkReady(index, url) {
     
     synthesizedCount++;
     document.getElementById('progress-fill').style.width = `${(synthesizedCount / currentChunks.length) * 100}%`;
-    document.getElementById('progress-text').textContent = `Progress: ${synthesizedCount}/${currentChunks.length}`;
+    updateOverallProgress();
+    if(synthesizedCount === currentChunks.length && overallTimer) {
+        clearInterval(overallTimer);
+        overallTimer = null;
+    }
     logMessage(`Part ${index + 1} ready.`);
     
     if(!isPlaying) {
@@ -455,6 +544,7 @@ async function processBackgroundChunks(chunks, speed) {
                 handleChunkReady(task.index, url);
             } catch(e) {
                 logMessage(`Error in part ${task.index + 1}: ${e.message}`);
+                if(chunkTimers[task.index]) clearInterval(chunkTimers[task.index].interval);
                 document.getElementById(`chunk-status-${task.index}`).textContent = '❌ Error';
             }
         }
@@ -479,7 +569,39 @@ def read_root():
 
 def main():
     start_viettts()
-    uvicorn.run(app, host="0.0.0.0", port=UI_PORT, log_level="error")
+    
+    config = uvicorn.Config(app, host="0.0.0.0", port=UI_PORT, log_level="error")
+    server = uvicorn.Server(config)
+    
+    # Disable Uvicorn's default signal handlers to prevent hanging on graceful shutdown
+    server.install_signal_handlers = lambda: None
+    
+    import signal
+    import sys
+    
+    def force_exit(signum, frame):
+        print("\n[VietTTS] Shutting down UI and background servers immediately...")
+        if tts_process:
+            try:
+                tts_process.kill()
+            except Exception:
+                pass
+        os.system("pkill -9 -f viettts")
+        os._exit(0)
+        
+    signal.signal(signal.SIGINT, force_exit)
+    signal.signal(signal.SIGTERM, force_exit)
+    
+    try:
+        server.run()
+    finally:
+        # Guarantee cleanup even if uvicorn throws an exception (e.g. OSError port in use)
+        if tts_process:
+            try:
+                tts_process.kill()
+            except Exception:
+                pass
+        os.system("pkill -9 -f viettts")
 
 if __name__ == "__main__":
     main()
