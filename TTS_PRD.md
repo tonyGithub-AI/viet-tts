@@ -117,8 +117,9 @@ def start_viettts():
         os.environ["PATH"] = f"{local_bin}:{os.environ['PATH']}"
 
     # Use 2 workers for parallel synthesis
+    # We remove DEVNULL so the user can see model loading progress directly in his terminal!
     subprocess.Popen(["viettts", "server", "--host", "0.0.0.0", "--port", str(VIET_TTS_PORT), "--workers", "2"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=os.environ)
+                     env=os.environ)
 
     # Poll for readiness
     for i in range(20):
@@ -128,42 +129,52 @@ def start_viettts():
 
     return False, "Server failed to start within 20 seconds. Check logs or manual launch."
 
-def restart_server():
-    """Kill any existing viettts process and restart."""
-    os.system("pkill -f viettts")
-    time.sleep(2)
-    return start_viettts()
-
 client = OpenAI(base_url=VIET_TTS_URL, api_key="viet-tts")
 
 def smart_split(text, max_chars=2000):
-    """Split into natural sentence chunks (~2K chars for FAST response)."""
+    """Split into natural sentence chunks, keeping First chunk extremely small for instant playback."""
     sentences = re.split(r'(?<=[\.!\?])\s+', text)
     chunks, current = [], ""
+
+    is_first_chunk = True
+
     for sent in sentences:
-        if len(sent) > max_chars:
+        target_limit = 250 if is_first_chunk else max_chars
+
+        if len(sent) > target_limit:
             if current.strip():
                 chunks.append(current.strip())
+                is_first_chunk = False
                 current = ""
+                # Re-evaluate target_limit since we committed a chunk
+                target_limit = 250 if is_first_chunk else max_chars
+
             words = sent.split()
             temp_chunk = ""
             for word in words:
-                if len(word) > max_chars:
+                if len(word) > target_limit:
                     if temp_chunk.strip():
                         chunks.append(temp_chunk.strip())
+                        is_first_chunk = False
+                        target_limit = 250 if is_first_chunk else max_chars
                         temp_chunk = ""
-                    for i in range(0, len(word), max_chars):
-                        chunks.append(word[i:i+max_chars])
-                elif len(temp_chunk + word) < max_chars:
+                    for i in range(0, len(word), target_limit):
+                        chunks.append(word[i:i+target_limit])
+                        is_first_chunk = False
+                        target_limit = 250 if is_first_chunk else max_chars
+                elif len(temp_chunk + word) < target_limit:
                     temp_chunk += word + " "
                 else:
                     chunks.append(temp_chunk.strip())
+                    is_first_chunk = False
+                    target_limit = 250 if is_first_chunk else max_chars
                     temp_chunk = word + " "
             current = temp_chunk
-        elif len((current + sent).strip()) < max_chars:
+        elif len((current + sent).strip()) < target_limit:
             current += sent + " "
         else:
             chunks.append(current.strip())
+            is_first_chunk = False
             current = sent + " "
 
     if current.strip():
@@ -193,35 +204,58 @@ def synth_chunk(i, chunk, speed):
         print(f"Error in synth_chunk {i}: {e}")
         return None
 
+MAX_CHUNKS = 50
+
 def read_aloud(text, speed, progress=gr.Progress(track_tqdm=True)):
     global tmp_files
 
     if not text or not text.strip():
-        yield [], "Enter text first!", ""
+        yield tuple(["Enter text first!", ""] + [gr.skip()] * MAX_CHUNKS)
         return
 
     # Pre-check server
     if not is_server_ready():
-        yield [], "❌ Connection Error: Backend server is offline.", "Server unreachable at " + VIET_TTS_URL
+        yield tuple(["❌ Connection Error: Backend server is offline.", "Server unreachable at " + VIET_TTS_URL] + [gr.skip()] * MAX_CHUNKS)
         return
 
     text = text.strip()
     progress(0, desc="Smart-splitting...")
     chunks = smart_split(text)
     n_chunks = len(chunks)
+    if n_chunks > MAX_CHUNKS:
+        n_chunks = MAX_CHUNKS
+        chunks = chunks[:MAX_CHUNKS]
 
-    audio_paths = [None] * n_chunks
+    # Hide all previously visible audio players first to give a clean slate
+    reset_audios = [gr.update(visible=False, value=None) for _ in range(MAX_CHUNKS)]
+    yield tuple(["Initializing...", gr.skip()] + reset_audios)
 
     # FAST approach: Generate first chunk immediately
-    progress(0, desc=f"FAST START: Chunk 1/{n_chunks}")
-    first_wav = synth_chunk(0, chunks[0], speed)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as fast_executor:
+        first_future = fast_executor.submit(synth_chunk, 0, chunks[0], speed)
+        seconds_waited = 0
+        while not first_future.done():
+            time.sleep(0.5)
+            seconds_waited += 0.5
+            # loop progress bar from 0.0 to 1.0 continuously
+            progress((seconds_waited % 5.0) / 5.0, desc=f"FAST START: Chunk 1/{n_chunks} ({seconds_waited:.1f}s)")
+            yield tuple([f"⏳ Synthesizing Chunk 1/{n_chunks}... ({seconds_waited:.1f}s)", gr.skip()] + [gr.skip()] * MAX_CHUNKS)
+
+        first_wav = first_future.result()
+
     if first_wav:
-        audio_paths[0] = first_wav
         tmp_files.append(first_wav)
-        yield [p for p in audio_paths if p], f"⚡ Chunk 1 ready! Starting playback while processing others...", ""
+        progress(1.0/n_chunks, desc=f"Chunk 1 ready!")
+
+        current_audio = [gr.skip()] * MAX_CHUNKS
+        current_audio[0] = gr.update(visible=True, value=first_wav, autoplay=True)
+        yield tuple([f"⚡ Chunk 1 ready! Starting playback while processing others...", gr.skip()] + current_audio)
+    else:
+        yield tuple([f"❌ Failed to synthesize Chunk 1", ""] + [gr.skip()] * MAX_CHUNKS)
+        return
 
     if n_chunks == 1:
-        yield [p for p in audio_paths if p], "✅ Complete: 1 chunk synthesized.", "Success"
+        yield tuple(["✅ Complete: 1 chunk synthesized.", "Success"] + [gr.skip()] * MAX_CHUNKS)
         return
 
     # Background parallel synthesis for remaining chunks
@@ -234,14 +268,15 @@ def read_aloud(text, speed, progress=gr.Progress(track_tqdm=True)):
             idx = future_to_idx[future]
             wav = future.result()
             if wav:
-                audio_paths[idx] = wav
                 tmp_files.append(wav)
+                current_audio = [gr.skip()] * MAX_CHUNKS
+                current_audio[idx] = gr.update(visible=True, value=wav, autoplay=False)
 
                 completed += 1
                 progress(completed/n_chunks, desc=f"Processed {completed}/{n_chunks} chunks")
-                yield [p for p in audio_paths if p], f"🔄 Synthesized {completed}/{n_chunks} chunks...", ""
+                yield tuple([f"🔄 Synthesized {completed}/{n_chunks} chunks...", gr.skip()] + current_audio)
 
-    yield [p for p in audio_paths if p], f"✅ COMPLETE: {n_chunks} chunks ready sequentially.", "Success"
+    yield tuple([f"✅ COMPLETE: {n_chunks} chunks ready sequentially.", "Success"] + [gr.skip()] * MAX_CHUNKS)
 
 # Cleanup on exit
 def cleanup():
@@ -251,6 +286,40 @@ def cleanup():
             try: os.remove(f)
             except: pass
 atexit.register(cleanup)
+
+# UI Logic
+def ui_restart():
+    yield "Status: 🔴 Shutting down existing server gracefully..."
+    os.system("pkill -f viettts")
+
+    # Wait for the server to actually go offline
+    for i in range(10):
+        if not is_server_ready():
+            yield "Status: 🔴 Server offline. Stopped successfully."
+            break
+        yield f"Status: 🔴 Waiting for server to stop... ({i+1}s)"
+        time.sleep(1)
+
+    yield "Status: 🟡 Starting new server instance..."
+    time.sleep(1)
+
+    local_bin = os.path.expanduser("~/.local/bin")
+    if local_bin not in os.environ["PATH"]:
+        os.environ["PATH"] = f"{local_bin}:{os.environ['PATH']}"
+
+    # Start the server subprocess
+    subprocess.Popen(["viettts", "server", "--host", "0.0.0.0", "--port", str(VIET_TTS_PORT), "--workers", "2"],
+                     env=os.environ)
+
+    # Poll for readiness with UI updates
+    for i in range(1, 61):
+        yield f"Status: ⏳ Loading AI Models... This takes time ({i}s)"
+        time.sleep(1)
+        if is_server_ready():
+            yield "Status: 🟢 Online"
+            return
+
+    yield "Status: ❌ Server failed to start. Check terminal logs."
 
 # UI Layout
 with gr.Blocks(title="VietTTS Reader") as demo:
@@ -274,15 +343,35 @@ with gr.Blocks(title="VietTTS Reader") as demo:
             gr.Markdown("---")
             btn = gr.Button("🎤 Read Aloud (FAST Approach)", variant="primary", size="lg")
 
-            audio_state = gr.State([])
-            @gr.render(inputs=audio_state)
-            def render_audio(paths):
-                if not paths:
-                    gr.Markdown("*Audio will appear here chunk-by-chunk...*")
-                for i, p in enumerate(paths):
-                    gr.Audio(value=p, label=f"▶️ Part {i+1}", interactive=False, autoplay=(i == 0))
+            status = gr.Textbox(label="📊 Progress Info", interactive=False)
+            gr.Markdown("*Audio will appear here chunk-by-chunk...*")
+            audio_players = []
+            for i in range(MAX_CHUNKS):
+                audio_players.append(gr.Audio(label=f"▶️ Part {i+1}", interactive=False, visible=False))
 
-            status = gr.Textbox(label="📊 Status", interactive=False)
+            gr.HTML("""
+            <script>
+            setInterval(function() {
+                var audios = document.querySelectorAll('audio');
+                for(var i=0; i<audios.length; i++) {
+                    if(!audios[i].hasAttribute('chained')) {
+                        audios[i].setAttribute('chained', 'true');
+                        audios[i].addEventListener('ended', function(e) {
+                            var allAudios = Array.from(document.querySelectorAll('audio'));
+                            var idx = allAudios.indexOf(e.target);
+                            if(idx >= 0 && idx < allAudios.length - 1) {
+                                var nextAudio = allAudios[idx + 1];
+                                if (nextAudio && nextAudio.src && nextAudio.src.indexOf('blob:') !== -1 || nextAudio.src.indexOf('file=') !== -1 || nextAudio.src !== "") {
+                                    // A small delay to ensure UI updates are complete
+                                    setTimeout(() => { nextAudio.play(); }, 500);
+                                }
+                            }
+                        });
+                    }
+                }
+            }, 1000);
+            </script>
+            """)
 
     with gr.Accordion("🛠️ Technical Details / Full Error Report", open=False):
         technical_log = gr.Code(label="Traceback Log", language="python", interactive=False)
@@ -290,7 +379,7 @@ with gr.Blocks(title="VietTTS Reader") as demo:
     gr.Markdown("*Optimal: 0.8-1.2x for audiobooks. ~5-10min synth for 20K chars.*")
 
     # Bindings
-    btn.click(read_aloud, inputs=[textbox, speed_slider], outputs=[audio_state, status, technical_log])
+    btn.click(read_aloud, inputs=[textbox, speed_slider], outputs=[status, technical_log] + audio_players)
     server_btn.click(ui_restart, outputs=[server_status])
 
     # On Load check
@@ -368,7 +457,7 @@ This section codifies the "Premium Soft" design system used for the VietTTS Read
 - **Error Resilience**:
   - **Pre-flight Check**: Backend connectivity is verified on load and before any synthesis request.
   - **Diagnostic Transparency**: Full technical tracebacks are exposed via the "Technical Details" accordion on failure, enabling user-led troubleshooting.
-  - **Self-Healing**: A dedicated "Restart Backend Server" button allows users to manually cycle the synthesis engine if connection drops.
+  - **Self-Healing**: A dedicated "Restart Backend Server" button cycles the synthesis engine if connection drops. It now implements a **generator-based pattern** providing rich, real-time UI feedback (graceful shutdown status, wait loops for freeing ports, and AI model load progress updates up to ~60s).
 - **Stitching Feedback**: Visual "Stitching audio..." indicator to prevent "frozen UI" perception during final normalization.
 - **Zero-State**: Placeholder text `Paste your full Vietnamese chapter here...` provides immediate affordance.
 - **Mobile Optimizations**: Rows collapse to stacks below 640px viewport width automatically via Gradio's responsive engine.
