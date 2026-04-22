@@ -31,9 +31,17 @@ def start_viettts():
         os.environ["PATH"] = f"{local_bin}:{os.environ['PATH']}"
         
     print(f"Starting VietTTS server on port {VIET_TTS_PORT} with 2 workers...")
+    
+    # Capture logs to a file for the UI to read
+    with open("viettts_server.log", "w") as f:
+        f.write("--- Server Start ---\n")
+        
+    log_file = open("viettts_server.log", "a")
     tts_process = subprocess.Popen(
-        ["viettts", "server", "--host", "0.0.0.0", "--port", str(VIET_TTS_PORT), "--workers", "2"],
-        env=os.environ
+        ["python3", "-c", "from viettts.cli import cli; cli()", "server", "--host", "0.0.0.0", "--port", str(VIET_TTS_PORT), "--workers", "2"],
+        env=os.environ,
+        stdout=log_file,
+        stderr=log_file
     )
 
 @atexit.register
@@ -50,6 +58,14 @@ def restart_server():
 @app.get("/api/status")
 def status():
     return {"ready": is_server_ready()}
+
+@app.get("/api/logs")
+def get_logs():
+    if os.path.exists("viettts_server.log"):
+        with open("viettts_server.log", "r") as f:
+            lines = f.readlines()
+            return {"logs": "".join(lines[-25:])}
+    return {"logs": "No logs found."}
 
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
@@ -180,9 +196,9 @@ audio { width: 100%; height: 36px; outline: none; }
             <div class="slider-group" style="margin-bottom: 0.5rem;">
                 <label><span>🗣️ Voice</span></label>
                 <select id="voice-select" style="padding: 0.8rem; background: rgba(15, 23, 42, 0.6); color: var(--text); border: 1px solid var(--border); border-radius: 12px; font-family: inherit; font-size: 0.95rem; outline: none; transition: border-color 0.3s; width: 100%; cursor: pointer;">
-                    <option value="nguyen-ngoc-ngan">Nguyễn Ngọc Ngạn (Male)</option>
-                    <option value="nu-nhe-nhang">Nữ Nhẹ Nhàng (Female)</option>
+                    <option value="nu-nhe-nhang" selected>Nữ Nhẹ Nhàng (Female)</option>
                     <option value="quynh">Quỳnh (Female)</option>
+                    <option value="nguyen-ngoc-ngan">Nguyễn Ngọc Ngạn (Male)</option>
                 </select>
             </div>
 
@@ -196,6 +212,11 @@ audio { width: 100%; height: 36px; outline: none; }
             <div class="progress-container" id="progress-container">
                 <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
                 <div class="progress-text" id="progress-text">Progress: 0/0</div>
+            </div>
+
+            <div id="startup-logs" style="display:none; font-family: monospace; font-size: 0.75rem; background: rgba(0,0,0,0.3); padding: 0.8rem; border-radius: 8px; border: 1px solid var(--border); max-height: 150px; overflow-y: auto; margin-top: 1rem; color: #a5f3fc;">
+                <div style="font-weight: 600; margin-bottom: 4px; color: var(--text-muted);">🛰️ Startup Feed:</div>
+                <div id="startup-log-content" style="white-space: pre-wrap;">Initializing...</div>
             </div>
 
             <div class="chunk-list" id="chunk-list">
@@ -269,10 +290,12 @@ async function checkStatus() {
         const data = await res.json();
         const badge = document.getElementById('status-badge');
         const text = document.getElementById('status-text');
+        const startupLogs = document.getElementById('startup-logs');
         
         if (data.ready) {
             badge.className = 'status-badge online';
             text.textContent = 'Server Online';
+            startupLogs.style.display = 'none';
             loadVoices();
             if(!isPlaying && synthesizedCount === (currentChunks.length || 0)) {
                 // Keep enabled if we are idle and server is ready
@@ -282,6 +305,18 @@ async function checkStatus() {
             badge.className = 'status-badge offline';
             text.textContent = 'Server Offline';
             document.getElementById('btn-read').disabled = true;
+            
+            // Fetch live startup logs
+            startupLogs.style.display = 'block';
+            try {
+                const lRes = await fetch('/api/logs');
+                const lData = await lRes.json();
+                const content = document.getElementById('startup-log-content');
+                if(content.textContent !== lData.logs) {
+                    content.textContent = lData.logs;
+                    content.parentElement.scrollTop = content.parentElement.scrollHeight;
+                }
+            } catch(e){}
         }
     } catch(e) {
         document.getElementById('status-badge').className = 'status-badge offline';
@@ -361,7 +396,7 @@ function smartSplit(text, maxChars = 2000) {
 }
 
 async function synthChunk(index, text, speed) {
-    const voiceId = document.getElementById('voice-select') ? document.getElementById('voice-select').value : 'nguyen-ngoc-ngan';
+    const voiceId = document.getElementById('voice-select') ? document.getElementById('voice-select').value : 'nu-nhe-nhang';
     const response = await fetch('http://localhost:8298/v1/audio/speech', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -484,6 +519,10 @@ function createAudioUI(index) {
     `;
     list.appendChild(div);
     
+    const charCount = currentChunks[index] ? currentChunks[index].length : 0;
+    // Updated based on user hardware telemetry (~1.8 seconds per character processing time on CPU base load)
+    const estTimeSecs = Math.max(180, Math.floor(charCount * 1.8));
+    
     chunkTimers[index] = {
         start: Date.now(),
         interval: setInterval(() => {
@@ -493,7 +532,17 @@ function createAudioUI(index) {
                 const m = Math.floor(elapsed / 60);
                 const s = elapsed % 60;
                 const t = m > 0 ? `${m}m ${s}s` : `${s}s`;
-                el.innerHTML = `⏳ Synthing... <b>${t}</b>`;
+                
+                const remaining = Math.max(0, estTimeSecs - elapsed);
+                const rm = Math.floor(remaining / 60);
+                const rs = remaining % 60;
+                const rt = rm > 0 ? `~${rm}m ${rs}s left` : `~${rs}s left`;
+                
+                if (elapsed >= estTimeSecs) {
+                    el.innerHTML = `⏳ Synthing... <b>${t}</b> <span style="font-size:0.85em; color:var(--text-muted); font-weight:normal; margin-left:4px">(finishing up...)</span>`;
+                } else {
+                    el.innerHTML = `⏳ Synthing... <b>${t}</b> <span style="font-size:0.85em; color:var(--text-muted); font-weight:normal; margin-left:4px">(${rt})</span>`;
+                }
             } else {
                 if(chunkTimers[index]) clearInterval(chunkTimers[index].interval);
             }
